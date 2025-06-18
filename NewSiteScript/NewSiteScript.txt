@@ -1,0 +1,304 @@
+
+using namespace System.Net
+using namespace System.Net.Mail
+using namespace System.Security.Cryptography
+
+
+param($Request, $TriggerMetadata)
+function ExitFunction {
+    param(
+        [Parameter(Mandatory = $true)][string]$statusMessage,
+        [Parameter(Mandatory = $true)][ValidateSet([HttpStatusCode]::OK, [HttpStatusCode]::BadRequest, [HttpStatusCode]::NotImplemented, [HttpStatusCode]::ServiceUnavailable, [HttpStatusCode]::Unauthorized, [HttpStatusCode]::InternalServerError)][System.Net.HttpStatusCode]$statusCode     # ValidateSet vymazat alebo doplnit
+    )
+    Write-Host "Exit function called with message: $statusMessage"
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+            StatusCode = $statusCode
+            Body       = $statusMessage
+        }
+    )
+    exit
+}
+function Parse-JWToken {
+    param([Parameter(Mandatory = $true)][string]$token)
+    # Only Access and ID tokens work (not Refresh tokens)
+    if ($token.Split('.').Count -ne 3 -or -not $token.StartsWith("eyJ")) {
+        ExitFunction -statusCode BadRequest -statusMessage "Invalid token"
+    }
+    # Header
+    $TokenHeader = $token.Split(".")[0].Replace('-', '+').Replace('_', '/')
+    # Fix padding as needed, keep adding "=" until string length modulus 4 reaches 0 (base64url encoding likes to cut it off)
+    while ($TokenHeader.Length % 4) { $TokenHeader += "=" }
+    # Convert from Base64 encoded string to PSObject
+    Try {
+        $TokenHeader = [System.Text.Encoding]::ASCII.GetString([system.convert]::FromBase64String($TokenHeader))
+        #Write-Host "DEBUG: TokenHeader: $TokenHeader"
+        $TokenHeader = $TokenHeader | ConvertFrom-Json
+    }
+    Catch {
+        ExitFunction -statusCode BadRequest -statusMessage "Invalid token"
+    }
+    # Payload
+    $TokenPayload = $token.Split(".")[1].Replace('-', '+').Replace('_', '/')
+    # Fix padding as needed, keep adding "=" until string length modulus 4 reaches 0
+    while ($TokenPayload.Length % 4) { $TokenPayload += "=" }
+    # Convert from Base64 encoded string to PSObject
+    Try {
+        $TokenPayload = [System.Text.Encoding]::ASCII.GetString([System.Convert]::FromBase64String($TokenPayload))
+        #Write-Host "DEBUG: TokenPayload: $TokenPayload"
+        $TokenPayload = $TokenPayload | ConvertFrom-Json
+    }
+    Catch {
+        ExitFunction -statusCode BadRequest -statusMessage "Invalid token"
+    }
+    # Signature
+    $TokenSignature = $token.Split(".")[2].Replace('-', '+').Replace('_', '/')
+    # Fix padding as needed, keep adding "=" until string length modulus 4 reaches 0
+    while ($TokenSignature.Length % 4) { $TokenSignature += "=" }
+    # Convert from Base64 to byte[]
+    Try {
+        $TokenSignatureBytes = [System.Convert]::FromBase64String($TokenSignature)
+    }
+    Catch {
+        ExitFunction -statusCode BadRequest -statusMessage "Invalid token signature"
+    }
+    # Check the Issuer
+    Write-Host "DEBUG: JWT Issuer: $($TokenPayload.iss)"
+    $TenantId = $env:WEBSITE_AUTH_OPENID_ISSUER.Split('/') | Where-Object { $_ -match '-' }
+    If ($TokenPayload.iss -notlike "https://login.microsoftonline.com/$TenantId/*") { ExitFunction -statusCode BadRequest -statusMessage 'Invalid issuer' }
+    
+    # Check the Audience
+    Write-Host "DEBUG: JWT Audience: $($TokenPayload.aud)"
+    If ($TokenPayload.aud -ne $env:WEBSITE_AUTH_CLIENT_ID) { ExitFunction -statusCode BadRequest -statusMessage "Invalid audience" }
+    
+    # check time validity
+    $unixEpochStart = New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)
+    $Now = [DateTime]::UtcNow
+    $TotalSeconds = ($Now - $unixEpochStart).TotalSeconds
+    # expiration
+    # temp disabled # If ($TotalSeconds -gt ($TokenPayload.exp + 30)) { ExitFunction -statusCode BadRequest -statusMessage 'token has expired' }
+    # not before
+    If ($TotalSeconds -lt ($TokenPayload.nbf - 30)) { ExitFunction -statusCode BadRequest -statusMessage 'token is not valid yet' }
+    # issued at - reject tokens that you deem too old
+    If ($unixEpochStart.AddSeconds($TokenPayload.iat) -lt $Now.AddHours(-12) ) { ExitFunction -statusCode BadRequest -statusMessage 'token is too old' }
+    Write-Host "DEBUG: JWT Time validation passed."
+    # verify signature
+    $Data = $token.Substring(0, $token.LastIndexOf('.'))
+    $DataBytes = [Text.Encoding]::UTF8.GetBytes($Data)
+    Switch ($TokenHeader.alg) {
+        'RS256' {
+            # get public key
+            $CacheFile = 'KeyCache.xml'
+            If (Test-Path $CacheFile) {
+                Write-Host "DEBUG: file found"
+                $KeyCache = Import-Clixml $CacheFile
+                $RSAKey = $KeyCache | Where-Object { $_.kid -eq $TokenHeader.kid }
+            }
+            If ($RSAKey) {
+                Write-Host "DEBUG: Key '$($TokenHeader.kid)' found in cache."
+            }
+            Else {
+                # get the key online
+                Write-Host "DEBUG: Key '$($TokenHeader.kid)' is new, fetching..."
+                Try {
+                    $Conf = Invoke-RestMethod 'https://login.microsoftonline.com/common/.well-known/openid-configuration'
+                    $jwks = Invoke-RestMethod $Conf.jwks_uri
+                }
+                Catch {
+                    ExitFunction -statusCode ServiceUnavailable -statusMessage 'Unable to get keys for signature validation'
+                }
+                If ($Conf.id_token_signing_alg_values_supported -ne @('RS256')) {
+                    Write-Host "WARNING: Token signing alg(s) have changed: $($Conf.id_token_signing_alg_values_supported)"
+                }
+                $RSAKey = $jwks.keys | Where-Object { $_.kid -eq $TokenHeader.kid }
+                If (-not $RSAKey) { ExitFunction -statusCode BadRequest -statusMessage 'no suitable key was found online' }
+                # convert the key from base64url to base64
+                $RSAKey.n = $RSAKey.n.Replace('-', '+').Replace('_', '/')
+                If ($RSAKey.n.Length % 4) { $RSAKey.n = $RSAKey.n.PadRight($RSAKey.n.Length + 4 - $RSAKey.n.Length % 4, '=') }
+                $RSAKey.e = $RSAKey.e.Replace('-', '+').Replace('_', '/')
+                If ($RSAKey.e.Length % 4) { $RSAKey.e = $RSAKey.e.PadRight($RSAKey.e.Length + 4 - $RSAKey.e.Length % 4, '=') }
+                # save to cache
+                $KeyCache += [PsCustomObject]@{
+                    'kid'      = $RSAKey.kid
+                    'n'        = $RSAKey.n
+                    'e'        = $RSAKey.e
+                    'datetime' = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                }
+                Export-Clixml -InputObject $KeyCache -Path $CacheFile
+                Write-Host "DEBUG: Key '$($RSAKey.kid)' saved to cache."
+            }
+            # create the crypto provider, import key, verify data
+            Try {
+                $RSAParameters = New-Object -TypeName System.Security.Cryptography.RSAParameters
+                $RSAParameters.Modulus = [Convert]::FromBase64String($RSAKey.n)
+                $RSAParameters.Exponent = [Convert]::FromBase64String($RSAKey.e)
+                $alg = New-Object -TypeName System.Security.Cryptography.RSACryptoServiceProvider
+                $alg.ImportParameters($RSAParameters)
+                $halg = 'SHA256'
+                $IsValid = $alg.VerifyData($DataBytes, $halg, $TokenSignatureBytes)
+                If (-not $IsValid) { ExitFunction -statusCode BadRequest -statusMessage 'Token signature verification failed.' }
+                $alg.Dispose()
+            }
+            Catch {
+                ExitFunction -statusCode InternalServerError -statusMessage 'Cryptographic verification failed'
+            }
+        }
+        default {
+            # RS256 is the only valid method at Microsoft right now.
+            ExitFunction -statusCode NotImplemented -statusMessage 'algorithm not implemented'
+        }
+    }
+    Write-Host "DEBUG: JWT Signature validation passed."
+    return $TokenPayload
+}
+if ($Null -ne $Request.Headers.'x-ms-client-principal') {
+    Write-Host "DEBUG: x-ms-client-principal: $($Request.Headers.'x-ms-client-principal')"
+}
+# Get roles from token
+if ($Null -ne $Request.Headers.'x-ms-token-aad-id-token') {
+    Write-Host "INFO: parsing token via x-ms-token-aad-id-token header. Seems to be delegated access via user account"
+    #Write-Host "DEBUG: JWT: $($Request.Headers.'x-ms-token-aad-id-token')"
+    $tokenObj = Parse-JWToken($Request.Headers.'x-ms-token-aad-id-token')
+    $tokenRoles = $tokenObj.Roles
+}
+elseif ($Null -ne $Request.Headers.'x-ms-client-principal') {
+    Write-Host "INFO: parsing token via x-ms-client-principal. Seems to be app access via app secret"
+    #Write-Host "DEBUG: $($Request.Headers.'x-ms-client-principal')"
+    Try {
+        $tokenByteArray = [System.Convert]::FromBase64String($Request.Headers.'x-ms-client-principal')
+        $tokenJson = [System.Text.Encoding]::ASCII.GetString($tokenByteArray)
+        #Write-Host "DEBUG: x-ms-client-principal: $tokenJson"
+        $tokenObj = $tokenJson | ConvertFrom-Json
+    }
+    Catch {
+        ExitFunction -statusCode BadRequest -statusMessage "Invalid x-ms-client-principal"
+    }
+    $tokenRoles = @()
+    foreach ($item in $tokenObj.claims) {
+        if ($item.typ -eq "roles") {
+            $tokenRoles += $item.val
+        }
+    }
+}
+else {
+    ExitFunction -statusCode BadRequest -statusMessage "missing token/principal"
+}
+# Interact with query parameters or the body of the request.
+
+
+
+####### main body
+$body = ""
+try {
+    #Get Environment Variables
+    $spo_name = $env:SPO_TENANT_NAME
+    #$spo_user = $env:SPO_USER_NAME
+    #$spo_pass = ConvertTo-SecureString -String $env:SPO_USER_PASSWORD -AsPlainText -Force
+    #Get Variables from Query
+    $site_type = [string]$Request.Query["Type"]
+    $site_title = [string]$Request.Query["Title"]
+    $site_name = [string]$Request.Query["Name"] 
+    $site_lcid = [int]$Request.Query["Lcid"] 
+    $site_owner = [string]$Request.Query["Owner"] 
+    $site_classification = [string]$Request.Query["Classification"]
+    $site_sensitivitylabel = [string]$Request.Query["SensitivityLabel"] 
+    $site_sitedesignid = [string]$Request.Query["SiteDesignId"]
+    $site_topicvalue = [string]$Request.Query["TopicValue"]
+    $site_url = "https://$spo_name.sharepoint.com/"
+    if ([string]::IsNullOrEmpty($site_type)) {
+        throw "Query attribute missing: Type"
+    }
+    if ([string]::IsNullOrEmpty($site_title)) {
+        throw "Query attribute missing: Title"
+    }
+    if ([string]::IsNullOrEmpty($site_name)) {
+        throw "Query attribute missing: Name"
+    }
+    if ([string]::IsNullOrEmpty($site_owner)) {
+        throw "Query attribute missing: Owner"
+    }
+    if ($site_lcid -le 0) {
+        $site_lcid = 1033
+    }
+    if ([string]::IsNullOrEmpty($site_classification)) {
+        $site_classification = $null
+    }
+    if ([string]::IsNullOrEmpty($site_sensitivitylabel)) {
+        $site_sensitivitylabel = $env:SPO_SENSITIVITY_LABEL
+    }
+    if ([string]::IsNullOrEmpty($site_sitedesignid)) {
+        $site_sitedesignid = "96c933ac-3698-44c7-9f4a-5fd17d71af9e"
+    }
+    # Authorization block
+    $requestIsAuthorized = $false
+    $authorizedRole = "DLG.SPO.ADMIN.$site_name" # DLG.MFA.ADMIN.EXO.AT
+    foreach ($role in $tokenRoles) {
+        Write-Host "checking role claim: $role"
+        if ($authorizedRole.StartsWith($role, 'CurrentCultureIgnoreCase')) {
+            $requestIsAuthorized = $true
+            Write-Host "Request is authorized."
+        }
+    }
+    if (-not $requestIsAuthorized) {
+        ExitFunction -statusCode Unauthorized -statusMessage "Authorization failure. Missing or improper role assignment for function."
+    }
+    Import-Module PnP.PowerShell
+    #$credentials = New-Object -TypeName System.Management.Automation.PSCredential($spo_user, $spo_pass)
+    #Connect-PnPOnline -Credentials $credentials -Url $site_url
+    Connect-PnPOnline -Url $site_url -ManagedIdentity
+    Write-Host "Connected to SPO"
+        
+    $parameters = @{
+        Type           = $site_type
+        Lcid           = $site_lcid
+        Classification = $site_classification
+    }
+    if ($site_type -eq "TeamSite") {
+        $parameters.Add('Title', $site_title)
+        $parameters.Add('Alias', $site_name)
+        $parameters.Add('Owners', @($site_owner))
+        $parameters.Add('SiteAlias', $site_name)
+    }
+    elseif ($site_type -eq "CommunicationSite") {
+        $parameters.Add('Title', $site_title)
+        $parameters.Add('Url', $site_url + 'sites/' + $site_name)
+        $parameters.Add('Owner', $site_owner)
+        $parameters.Add('SiteDesignId', $site_sitedesignid)
+    }
+    elseif ($site_type -eq "TeamSiteWithoutMicrosoft365Group") {
+        $parameters.Add('Title', $site_title)
+        $parameters.Add('Url', $site_url + 'sites/' + $site_name)
+        $parameters.Add('Owner', $site_owner)
+        $parameters.Add('SiteDesignId', $site_sitedesignid)
+    }
+    else {
+        throw "Site Type not supported. Allowed types: TeamSite, CommunicationSite, TeamSiteWithoutMicrosoft365Group."
+    }
+    $result = New-PnPSite @parameters
+    if (($site_topicvalue) -and ($site_type -eq "CommunicationSite")) {
+        $targetSite = "https://$spo_name.sharepoint.com/sites/$site_name"
+        $adminSite = "https://$spo_name-admin.sharepoint.com"
+        Connect-PnPOnline -Url $adminSite -ManagedIdentity
+        Set-PnPSite -Identity $targetSite -NoScriptSite $false
+        Start-Sleep -Seconds 10
+        #Set Property Bag Value for topic site
+        Connect-PnPOnline -Url $targetSite -ManagedIdentity
+        Set-PnPPropertyBagValue -Key "IntranetTopic" -Value $site_topicvalue -Indexed
+        Start-Sleep -Seconds 10
+        Connect-PnPOnline -Url $adminSite -ManagedIdentity
+        Set-PnPSite -Identity $targetSite -NoScriptSite $false
+    }
+    $body = $result
+}
+catch [system.exception] {
+    $body = $_.Exception.Message
+}
+finally {
+    Disconnect-PnPOnline
+    Get-PSSession | Remove-PSSession
+}
+$error.clear()
+Write-Host $body
+Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        StatusCode = [HttpStatusCode]::OK
+        Body       = $body
+    })
