@@ -1,0 +1,52 @@
+Function creation:
+	1) Create new Function app in AAD with PowerShell Core runtime stack, OS Windows, 
+	2) Add PnP.PowerShell PowerShell Module
+		As we want to use PowerShell to connect to Sharepoint Online, we need to add the PnP.PowerShell module to our app. This is done by modifying the requirements.psd1 file
+		@{
+		    'PnP.PowerShell' = '2.*'
+		}
+		In the profile.psd1 file disable Authenticate with Azure PowerShell using MSI section as we do not need it
+		#if ($env:MSI_SECRET) {
+		#    Disable-AzContextAutosave -Scope Process | Out-Null
+		#    Connect-AzAccount -Identity
+		#}
+	3) In Authentication blade, add Microsoft as identity provider in Azure function (note name of AAD application, you will need it later)
+	4) Enable system managed identity in Azure function
+	5) Create following function variables:
+			a. SPO_SENSITIVITY_LABEL – set value to GUID of sensitivity label, that will be applied to SPO site, if no label is specified via function parameter.
+			b. SPO_TENANT_NAME – set value to short tenant name. e.g. deverstegroup
+	6) Create new function with HTTP trigger template. Use name NewSite. As authorization select Anonymous (auth. will be handled via AAD integration). Replace function code with code from attachment.
+	7) Grand Directory.ReadWrite.All & Sites.FullControl.All permissions to managed identity. You can follow this link: https://nanddeepnachanblogs.com/posts/2023-10-17-mi-pnp-powershell-sp-acs/ - skip directly to chapter Assign permissions to the managed identity
+ 
+Configure AAD authorization:
+	1) Open AAD -> App registrations and find the application you created in step 3 above.
+	2) Select App roles.
+	3) Click on Create new role and create role with following settings:
+		
+		
+	4) Open AAD -> Enterprise applications and find the same application.
+	5) Select Properties and switch Assignment required to Yes. (this steps is very important!)
+	6) Visible to users set to No
+	7) Click on Users and groups and add some test user and assign him the role DLG.SPO.ADMIN.AT
+		
+		
+ 
+Test basic function invocation:
+	1) As user you added in step 7 above, open browser and paste this URL: https://dlgautomationspo.azurewebsites.net/api/NewSite?Type=CommunicationSite&Title=estSite&Name=ATtestsite1&Owner=admin.furda@deverstegroup.onmicrosoft.com
+		Note: replace function URL & owner UPN with your values
+	2) After authorization, the site should be created.
+ 
+ 
+Full list of available input parameters:
+	· Type - string, required, specifies type of new site. Possible values: TeamSite, CommunicationSite, TeamSiteWithoutMicrosoft365Group
+	· Title - string, required, description of site
+	· Name - string, required, name of new site, will be used in url behind /sites/
+	· Owner - string, required, UserPrincipalName of new site owner
+	· Lcid - string, default 1033 for English, Language locale id
+	· Classification, string, Classification description
+	· SensitivityLabel, string, default Erste Group Only, Sensitivity label id
+	· SiteDesignId, string, default 96c933ac-3698-44c7-9f4a-5fd17d71af9e, Topic: 96c933ac-3698-44c7-9f4a-5fd17d71af9e, Showcase: 6142d2a0-63a5-4ba0-aede-d9fefca2c767, Blank: f6cc5403-0d63-442e-96c0-285923709ffc
+Next steps:
+            We need your final decision how you will be calling newsite function – for service principal or system managed identity additional authorization configuration is needed.
+ 
+
